@@ -401,12 +401,23 @@ def renderAnalysis(result: AnalysisResult, tokens: int) -> None:
 # ---------------------------------------------------------------------------
 
 def main(
+    command: str = typer.Argument(None, help="Command: analyze or write"),
     analyze: bool = typer.Option(False, "--analyze", help="Analyze commit message quality."),
     write: bool = typer.Option(False, "--write", help="Suggest a commit message for staged changes."),
     count: int = typer.Option(50, "--count", "-n", help="Number of commits to analyze."),
     url: str | None = typer.Option(None, "--url", "-u", help="Remote repo URL to analyze."),
 ) -> None:
     """AI-powered commit message analyzer and writer."""
+    # Support both positional (analyze/write) and flag (--analyze/--write) syntax
+    if command == "analyze":
+        analyze = True
+    elif command == "write":
+        write = True
+    elif command is not None:
+        console.print(f'[red]Unknown command: "{command}"[/red]')
+        console.print("Use [bold]--analyze[/bold] or [bold]--write[/bold]. See --help.")
+        raise typer.Exit(1)
+
     if not analyze and not write:
         console.print("Usage: python commit_critic.py [OPTIONS]\n")
         console.print("  --analyze        Analyze commit message quality")
