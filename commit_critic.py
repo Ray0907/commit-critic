@@ -18,7 +18,6 @@ from rich.prompt import Prompt
 
 load_dotenv()
 
-app = typer.Typer(help="AI-powered commit message analyzer and writer.", invoke_without_command=True)
 console = Console()
 
 
@@ -230,7 +229,7 @@ def analyzeCommits(commits: list[dict], repo_path: str = ".") -> tuple[AnalysisR
 
 For commits scoring < 7, provide:
 - "issue": why it's bad (1 sentence)
-- "suggestion": a better commit message
+- "suggestion": a better commit message (single line, type(scope): description format, max 72 chars)
 
 For commits scoring >= 7, provide:
 - "praise": why it's good (1 sentence)
@@ -246,7 +245,7 @@ Commits:
 Respond with ONLY valid JSON:
 {{
     "commits": [
-        {{"hash": "abc12345", "message": "the subject", "score": 5, "issue": "...", "suggestion": "...", "praise": null}}
+        {{"hash": "abc12345", "message": "the subject", "score": 5, "issue": "...", "suggestion": "fix(auth): resolve token handling", "praise": null}}
     ],
     "average_score": 5.0,
     "count_vague": 10,
@@ -269,7 +268,7 @@ Respond with ONLY valid JSON:
     # Phase 2: Diff-aware re-analysis for worst commits
     # Deterministic index mapping - never trust LLM-returned identifiers
     worst_with_idx = [
-        (i, c) for i, c in enumerate(result.commits) if c.score <= 4
+        (i, c) for i, c in enumerate(result.commits) if c.score <= 6
     ]
     if worst_with_idx:
         diff_parts = []
@@ -286,8 +285,9 @@ Suggest a better message that matches the actual diff.
 
 {chr(10).join(diff_parts)}
 
-Respond with ONLY valid JSON array using the index number:
-[{{"index": 0, "suggestion": "better message based on actual changes"}}]"""
+Respond with ONLY valid JSON array using the index number.
+Each suggestion must be a SINGLE LINE in type(scope): description format, max 72 chars.
+[{{"index": 0, "suggestion": "fix(auth): resolve token expiration handling"}}]"""
 
             raw2, tokens2 = callLlm(prompt_phase2)
             total_tokens += tokens2
@@ -400,24 +400,27 @@ def renderAnalysis(result: AnalysisResult, tokens: int) -> None:
 # CLI commands
 # ---------------------------------------------------------------------------
 
-@app.callback()
 def main(
-    ctx: typer.Context,
-    do_analyze: bool = typer.Option(False, "--analyze", help="Analyze commit message quality."),
-    do_write: bool = typer.Option(False, "--write", help="Suggest a commit message for staged changes."),
+    analyze: bool = typer.Option(False, "--analyze", help="Analyze commit message quality."),
+    write: bool = typer.Option(False, "--write", help="Suggest a commit message for staged changes."),
     count: int = typer.Option(50, "--count", "-n", help="Number of commits to analyze."),
     url: str | None = typer.Option(None, "--url", "-u", help="Remote repo URL to analyze."),
 ) -> None:
     """AI-powered commit message analyzer and writer."""
-    if not do_analyze and not do_write:
-        console.print(ctx.get_help())
+    if not analyze and not write:
+        console.print("Usage: python commit_critic.py [OPTIONS]\n")
+        console.print("  --analyze        Analyze commit message quality")
+        console.print("  --write          Suggest a commit message for staged changes")
+        console.print("  --count, -n      Number of commits to analyze [default: 50]")
+        console.print("  --url, -u        Remote repo URL to analyze")
+        console.print("  --help           Show this message and exit")
         raise typer.Exit(0)
 
-    if do_analyze and do_write:
+    if analyze and write:
         console.print("[red]Choose one: --analyze or --write, not both.[/red]")
         raise typer.Exit(1)
 
-    if do_analyze:
+    if analyze:
         runAnalyze(count, url)
     else:
         runWrite()
@@ -485,4 +488,4 @@ def runWrite() -> None:
 
 
 if __name__ == "__main__":
-    app()
+    typer.run(main)
