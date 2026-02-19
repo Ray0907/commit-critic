@@ -163,5 +163,189 @@ def executeCommit(message: str) -> None:
     console.print(f"[green]Committed![/green] {result.stdout.strip()}")
 
 
+# ---------------------------------------------------------------------------
+# LLM interaction
+# ---------------------------------------------------------------------------
+
+SCORING_RUBRIC = """Score each commit message on a 1-10 scale:
+- 1-3: No useful info (wip, fix, update, typo, misc)
+- 4-6: Some context but missing scope, type prefix, or details
+- 7-8: Good conventional commit with clear scope and description
+- 9-10: Excellent - type(scope), detailed body, measurable impact"""
+
+
+def callLlm(prompt: str) -> tuple[str, int]:
+    """Call LLM and return (content, total_tokens). Handles auth errors."""
+    try:
+        response = completion(
+            model=getModel(),
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "auth" in error_msg or "api key" in error_msg or "api_key" in error_msg:
+            console.print(
+                "[red]Authentication failed.[/red]\n"
+                "Set your API key: export OPENAI_API_KEY=sk-...\n"
+                "(or ANTHROPIC_API_KEY for Claude)\n"
+                "Choose model: export LITELLM_MODEL=gpt-4o-mini"
+            )
+            raise typer.Exit(1)
+        raise
+
+    content = response.choices[0].message.content
+    tokens = response.usage.total_tokens if response.usage else 0
+    return content, tokens
+
+
+def parseLlmJson(raw: str, model_cls: type):
+    """Parse LLM JSON response. Returns None on failure."""
+    try:
+        data = json.loads(raw)
+        return model_cls(**data)
+    except Exception:
+        return None
+
+
+def analyzeCommits(commits: list[dict], repo_path: str = ".") -> tuple[AnalysisResult, int]:
+    """
+    Two-phase diff-aware analysis:
+    1. Batch score all messages (one LLM call)
+    2. Re-analyze worst commits with their diff stat context
+    Returns (result, total_tokens).
+    """
+    total_tokens = 0
+
+    # Phase 1: Batch score
+    commits_text = "\n".join(
+        f"- [{c['hash']}] {c['subject']}"
+        + (f"\n  {c['body']}" if c['body'] else "")
+        for c in commits
+    )
+
+    prompt_phase1 = f"""Analyze these git commit messages and score each one.
+
+{SCORING_RUBRIC}
+
+For commits scoring < 7, provide:
+- "issue": why it's bad (1 sentence)
+- "suggestion": a better commit message
+
+For commits scoring >= 7, provide:
+- "praise": why it's good (1 sentence)
+
+Also calculate:
+- average_score: mean of all scores (1 decimal)
+- count_vague: commits with score <= 5
+- count_one_word: commits where the subject is a single word
+
+Commits:
+{commits_text}
+
+Respond with ONLY valid JSON:
+{{
+    "commits": [
+        {{"hash": "abc12345", "message": "the subject", "score": 5, "issue": "...", "suggestion": "...", "praise": null}}
+    ],
+    "average_score": 5.0,
+    "count_vague": 10,
+    "count_one_word": 3
+}}"""
+
+    raw, tokens = callLlm(prompt_phase1)
+    total_tokens += tokens
+
+    result = parseLlmJson(raw, AnalysisResult)
+    if result is None:
+        raw, tokens = callLlm(prompt_phase1)
+        total_tokens += tokens
+        result = parseLlmJson(raw, AnalysisResult)
+        if result is None:
+            console.print("[red]Failed to parse LLM response.[/red]")
+            console.print(raw[:500])
+            raise typer.Exit(1)
+
+    # Phase 2: Diff-aware re-analysis for worst commits
+    # Deterministic index mapping - never trust LLM-returned identifiers
+    worst_with_idx = [
+        (i, c) for i, c in enumerate(result.commits) if c.score <= 4
+    ]
+    if worst_with_idx:
+        diff_parts = []
+        for idx, (i, c) in enumerate(worst_with_idx[:5]):
+            original_hash = commits[i]["hash"]
+            diff_stat = getCommitDiff(original_hash, repo_path)
+            if diff_stat:
+                diff_stat = diff_stat[:2000]
+                diff_parts.append(f"[{idx}] \"{c.message}\"\n{diff_stat}")
+
+        if diff_parts:
+            prompt_phase2 = f"""These commits scored poorly. Here's what they actually changed.
+Suggest a better message that matches the actual diff.
+
+{chr(10).join(diff_parts)}
+
+Respond with ONLY valid JSON array using the index number:
+[{{"index": 0, "suggestion": "better message based on actual changes"}}]"""
+
+            raw2, tokens2 = callLlm(prompt_phase2)
+            total_tokens += tokens2
+
+            try:
+                improvements = json.loads(raw2)
+                if isinstance(improvements, list):
+                    for item in improvements:
+                        idx = item["index"]
+                        if 0 <= idx < len(worst_with_idx):
+                            orig_idx, _ = worst_with_idx[idx]
+                            result.commits[orig_idx].suggestion = item["suggestion"]
+            except (json.JSONDecodeError, KeyError, IndexError):
+                pass  # Phase 2 is best-effort
+
+    return result, total_tokens
+
+
+def suggestCommitMessage(diff: str, stat: str) -> tuple[SuggestedCommit, int]:
+    """Send staged diff to LLM with smart truncation."""
+    max_diff_chars = 12000
+    diff_truncated = diff[:max_diff_chars]
+    if len(diff) > max_diff_chars:
+        diff_truncated += f"\n\n... (truncated, {len(diff) - max_diff_chars} chars omitted)"
+
+    prompt = f"""Based on this staged git diff, write a commit message.
+
+File stats:
+{stat}
+
+Diff:
+{diff_truncated}
+
+Respond with ONLY valid JSON:
+{{
+    "message": "type(scope): subject\\n\\n- bullet point 1\\n- bullet point 2",
+    "summary": "Human readable summary of what changed"
+}}
+
+Rules:
+- First line: type(scope): description (under 72 chars)
+- Types: feat, fix, refactor, docs, test, chore, perf, ci
+- Body: bullet points of specific changes
+- Be specific and accurate to the actual diff"""
+
+    raw, tokens = callLlm(prompt)
+    result = parseLlmJson(raw, SuggestedCommit)
+    if result is None:
+        raw, tokens2 = callLlm(prompt)
+        tokens += tokens2
+        result = parseLlmJson(raw, SuggestedCommit)
+        if result is None:
+            console.print("[red]Failed to parse LLM response.[/red]")
+            console.print(raw[:500])
+            raise typer.Exit(1)
+
+    return result, tokens
+
+
 if __name__ == "__main__":
     app()
