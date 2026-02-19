@@ -29,13 +29,13 @@ Any [litellm-supported provider](https://docs.litellm.ai/docs/providers) works. 
 
 ```bash
 # Analyze last 50 commits in current repo
-python commit_critic.py analyze
+python commit_critic.py --analyze
 
 # Analyze last 20 commits
-python commit_critic.py analyze -n 20
+python commit_critic.py --analyze -n 20
 
 # Analyze a remote repository
-python commit_critic.py analyze --url="https://github.com/user/repo"
+python commit_critic.py --analyze --url="https://github.com/user/repo"
 ```
 
 ### Write a commit message
@@ -45,10 +45,10 @@ python commit_critic.py analyze --url="https://github.com/user/repo"
 git add -p
 
 # Get an AI-suggested commit message
-python commit_critic.py write
+python commit_critic.py --write
 ```
 
-The `write` command reads your staged diff, generates a conventional commit message, and lets you accept or override it before committing.
+The `--write` flag reads your staged diff, generates a conventional commit message, and lets you accept or override it before committing.
 
 ## How It Works
 
@@ -77,7 +77,7 @@ Single-file design (`commit_critic.py`, ~470 lines):
 | Git operations | Log parsing, diff extraction, shallow clone |
 | LLM interaction | Two-phase analysis, commit suggestion, retry logic |
 | Output formatting | Rich panels for terminal display |
-| CLI commands | Typer commands: `analyze` and `write` |
+| CLI commands | Typer `--analyze` and `--write` flags |
 
 ## Dependencies
 

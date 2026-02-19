@@ -18,7 +18,7 @@ from rich.prompt import Prompt
 
 load_dotenv()
 
-app = typer.Typer(help="AI-powered commit message analyzer and writer.")
+app = typer.Typer(help="AI-powered commit message analyzer and writer.", invoke_without_command=True)
 console = Console()
 
 
@@ -400,11 +400,30 @@ def renderAnalysis(result: AnalysisResult, tokens: int) -> None:
 # CLI commands
 # ---------------------------------------------------------------------------
 
-@app.command()
-def analyze(
+@app.callback()
+def main(
+    ctx: typer.Context,
+    do_analyze: bool = typer.Option(False, "--analyze", help="Analyze commit message quality."),
+    do_write: bool = typer.Option(False, "--write", help="Suggest a commit message for staged changes."),
     count: int = typer.Option(50, "--count", "-n", help="Number of commits to analyze."),
     url: str | None = typer.Option(None, "--url", "-u", help="Remote repo URL to analyze."),
 ) -> None:
+    """AI-powered commit message analyzer and writer."""
+    if not do_analyze and not do_write:
+        console.print(ctx.get_help())
+        raise typer.Exit(0)
+
+    if do_analyze and do_write:
+        console.print("[red]Choose one: --analyze or --write, not both.[/red]")
+        raise typer.Exit(1)
+
+    if do_analyze:
+        runAnalyze(count, url)
+    else:
+        runWrite()
+
+
+def runAnalyze(count: int, url: str | None) -> None:
     """Analyze commit message quality in a git repository."""
     dir_repo: str | None = None
 
@@ -436,8 +455,7 @@ def analyze(
             shutil.rmtree(dir_repo, ignore_errors=True)
 
 
-@app.command()
-def write() -> None:
+def runWrite() -> None:
     """Suggest a commit message for your staged changes."""
     checkGitRepo()
 
