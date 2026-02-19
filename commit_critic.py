@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 from bisect import bisect_left
+from pathlib import Path
 from typing import TypeVar
 
 import litellm
@@ -280,15 +281,6 @@ def getStagedStat() -> str:
     return result.stdout.strip()
 
 
-def normalizeRepoUrl(url: str) -> str:
-    """Convert DeepWiki or other known URLs to a cloneable GitHub URL."""
-    if "deepwiki.com/" in url:
-        # https://deepwiki.com/owner/repo -> https://github.com/owner/repo
-        path = url.split("deepwiki.com/", 1)[1].strip("/")
-        return f"https://github.com/{path}"
-    return url
-
-
 def _validateGitUrl(url: str) -> None:
     """Reject URLs that could be used for command injection or local file access."""
     stripped = url.strip()
@@ -301,33 +293,31 @@ def _validateGitUrl(url: str) -> None:
 
 
 def cloneShallow(url: str, count: int) -> str:
-    """Shallow clone a repo to a temp directory.
-
-    Tries normalized URL first, falls back to original.
-    """
+    """Shallow clone a repo to a temp directory."""
     _validateGitUrl(url)
-    url_normalized = normalizeRepoUrl(url)
-    urls_to_try = (
-        [url_normalized]
-        if url_normalized == url
-        else [url_normalized, url]
+    dir_tmp = tempfile.mkdtemp(prefix="commit_critic_")
+    result = subprocess.run(
+        ["git", "clone", "--depth", str(count), url, dir_tmp],
+        capture_output=True,
+        text=True,
     )
-
-    error_last = ""
-    for url_attempt in urls_to_try:
-        dir_tmp = tempfile.mkdtemp(prefix="commit_critic_")
-        result = subprocess.run(
-            ["git", "clone", "--depth", str(count), url_attempt, dir_tmp],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            return dir_tmp
-        error_last = result.stderr.strip()
-        shutil.rmtree(dir_tmp, ignore_errors=True)
-
-    console.print(f"[red]Failed to clone {url}:[/red] {error_last}")
+    if result.returncode == 0:
+        return dir_tmp
+    error_msg = result.stderr.strip()
+    shutil.rmtree(dir_tmp, ignore_errors=True)
+    console.print(f"[red]Failed to clone {url}:[/red] {error_msg}")
     raise typer.Exit(1)
+
+
+def readRepoReadme(path_repo: str, limit_chars: int = 1500) -> str:
+    """Read the repo's README for LLM context. Returns "" if not found."""
+    matches = list(Path(path_repo).glob("[Rr][Ee][Aa][Dd][Mm][Ee].[Mm][Dd]"))
+    if not matches:
+        return ""
+    try:
+        return matches[0].read_text(encoding="utf-8", errors="replace")[:limit_chars]
+    except OSError:
+        return ""
 
 
 def executeCommit(message: str) -> None:
@@ -352,6 +342,13 @@ SCORING_RUBRIC = """Score each commit message on a 1-10 scale:
 - 4-6: Some context but missing scope, type prefix, or details
 - 7-8: Good conventional commit with clear scope and description
 - 9-10: Excellent - type(scope), detailed body, measurable impact"""
+
+
+def _buildReadmePrefix(context_repo: str) -> str:
+    """Build a prompt prefix from README content. Returns "" if no content."""
+    if not context_repo:
+        return ""
+    return f"Project context (from README):\n{context_repo}\n---\n\n"
 
 
 def callLlm(prompt: str) -> tuple[str, int]:
@@ -411,6 +408,7 @@ def _refineSuggestionsWithDiff(
     result: AnalysisResult,
     commits: list[dict],
     repo_path: str,
+    context_repo: str = "",
 ) -> int:
     """Re-analyze worst commits with diff context. Returns tokens used.
 
@@ -435,7 +433,7 @@ def _refineSuggestionsWithDiff(
         return 0
 
     diff_block = "\n".join(diff_parts)
-    prompt = f"""These commits scored poorly. Here's what they actually changed.
+    prompt = f"""{_buildReadmePrefix(context_repo)}These commits scored poorly. Here's what they actually changed.
 Suggest a better message that matches the actual diff.
 
 {diff_block}
@@ -466,13 +464,15 @@ def analyzeCommits(commits: list[dict], repo_path: str = ".") -> tuple[AnalysisR
     Phase 1: Batch score all messages (one LLM call).
     Phase 2: Re-analyze worst commits with their diff stat context.
     """
+    context_repo = readRepoReadme(repo_path)
+
     commits_text = "\n".join(
         f"- [{c['hash']}] {c['subject']}"
         + (f"\n  {c['body']}" if c["body"] else "")
         for c in commits
     )
 
-    prompt = f"""Analyze these git commit messages and score each one.
+    prompt = f"""{_buildReadmePrefix(context_repo)}Analyze these git commit messages and score each one.
 
 {SCORING_RUBRIC}
 
@@ -502,19 +502,21 @@ Respond with ONLY valid JSON:
         1 for c in commits if len(c["subject"].split()) == 1
     )
 
-    tokens_phase2 = _refineSuggestionsWithDiff(result, commits, repo_path)
+    tokens_phase2 = _refineSuggestionsWithDiff(result, commits, repo_path, context_repo)
 
     return result, tokens_phase1 + tokens_phase2
 
 
-def suggestCommitMessage(diff: str, stat: str) -> tuple[SuggestedCommit, int]:
+def suggestCommitMessage(diff: str, stat: str, repo_path: str = ".") -> tuple[SuggestedCommit, int]:
     """Send staged diff to LLM with smart truncation."""
+    context_repo = readRepoReadme(repo_path)
+
     max_diff_chars = 12000
     diff_truncated = diff[:max_diff_chars]
     if len(diff) > max_diff_chars:
         diff_truncated += f"\n\n... (truncated, {len(diff) - max_diff_chars} chars omitted)"
 
-    prompt = f"""Based on this staged git diff, write a commit message.
+    prompt = f"""{_buildReadmePrefix(context_repo)}Based on this staged git diff, write a commit message.
 
 File stats:
 {stat}

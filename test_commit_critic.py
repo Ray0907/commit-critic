@@ -17,10 +17,12 @@ from commit_critic import (
     RECORD_SEP,
     SuggestedCommit,
     _buildHistogram,
+    _buildReadmePrefix,
     analyzeCommits,
     checkGitRepo,
     getCommits,
     parseLlmJson,
+    readRepoReadme,
     renderAnalysis,
     suggestCommitMessage,
 )
@@ -144,6 +146,42 @@ class TestGitOperations:
 
 
 # ---------------------------------------------------------------------------
+# readRepoReadme
+# ---------------------------------------------------------------------------
+
+class TestReadRepoReadme:
+    def test_reads_readme(self, tmp_path: object) -> None:
+        readme = tmp_path / "README.md"  # type: ignore[operator]
+        readme.write_text("# My Project\nSome description here.")
+        assert readRepoReadme(str(tmp_path)) == "# My Project\nSome description here."
+
+    def test_returns_empty_when_missing(self, tmp_path: object) -> None:
+        assert readRepoReadme(str(tmp_path)) == ""
+
+    def test_truncates_to_limit(self, tmp_path: object) -> None:
+        readme = tmp_path / "README.md"  # type: ignore[operator]
+        readme.write_text("x" * 3000)
+        result = readRepoReadme(str(tmp_path), limit_chars=100)
+        assert len(result) == 100
+
+    def test_case_insensitive(self, tmp_path: object) -> None:
+        readme = tmp_path / "readme.md"  # type: ignore[operator]
+        readme.write_text("lowercase readme")
+        assert readRepoReadme(str(tmp_path)) == "lowercase readme"
+
+
+class TestBuildReadmePrefix:
+    def test_returns_empty_for_empty_input(self) -> None:
+        assert _buildReadmePrefix("") == ""
+
+    def test_wraps_content_with_header_and_separator(self) -> None:
+        result = _buildReadmePrefix("# My Project")
+        assert result.startswith("Project context (from README):")
+        assert "# My Project" in result
+        assert result.endswith("---\n\n")
+
+
+# ---------------------------------------------------------------------------
 # LLM helpers
 # ---------------------------------------------------------------------------
 
@@ -204,7 +242,8 @@ class TestLlmHelpers:
             total_tokens=500,
         )
 
-        with patch("commit_critic.completion", return_value=response_fake):
+        with patch("commit_critic.completion", return_value=response_fake), \
+             patch("commit_critic.readRepoReadme", return_value=""):
             result, tokens = analyzeCommits([
                 {"hash": "abc12345", "subject": "wip", "body": ""},
                 {"hash": "def67890", "subject": "feat: add X", "body": ""},
@@ -250,7 +289,8 @@ class TestLlmHelpers:
         )
 
         with patch("commit_critic.completion", side_effect=[response_phase1, response_phase2]), \
-             patch("commit_critic.getCommitDiff", return_value="file.py | 10 +++---"):
+             patch("commit_critic.getCommitDiff", return_value="file.py | 10 +++---"), \
+             patch("commit_critic.readRepoReadme", return_value=""):
             result, tokens = analyzeCommits([
                 {"hash": "aaaa1234", "subject": "fix", "body": ""},
                 {"hash": "bbbb5678", "subject": "feat: good", "body": ""},
@@ -268,7 +308,8 @@ class TestLlmHelpers:
             total_tokens=300,
         )
 
-        with patch("commit_critic.completion", return_value=response_fake):
+        with patch("commit_critic.completion", return_value=response_fake), \
+             patch("commit_critic.readRepoReadme", return_value=""):
             result, tokens = suggestCommitMessage("diff content", "1 file changed")
 
         assert "feat" in result.message
@@ -284,11 +325,28 @@ class TestLlmHelpers:
             total_tokens=200,
         )
 
-        with patch("commit_critic.completion", return_value=response_fake) as mock_comp:
+        with patch("commit_critic.completion", return_value=response_fake) as mock_comp, \
+             patch("commit_critic.readRepoReadme", return_value=""):
             suggestCommitMessage(diff_large, "stat")
             prompt_sent = mock_comp.call_args[1]["messages"][0]["content"]
             assert "truncated" in prompt_sent
             assert len(prompt_sent) < 20000
+
+    def test_suggest_commit_includes_readme_context(self) -> None:
+        response_fake = _makeLlmResponse(
+            content=json.dumps({
+                "message": "feat(api): add endpoint",
+                "changes": ["Added endpoint"],
+            }),
+            total_tokens=200,
+        )
+
+        with patch("commit_critic.completion", return_value=response_fake) as mock_comp, \
+             patch("commit_critic.readRepoReadme", return_value="# Cool Project"):
+            suggestCommitMessage("diff", "stat")
+            prompt_sent = mock_comp.call_args[1]["messages"][0]["content"]
+            assert "Project context (from README):" in prompt_sent
+            assert "# Cool Project" in prompt_sent
 
 
 # ---------------------------------------------------------------------------

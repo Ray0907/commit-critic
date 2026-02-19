@@ -169,6 +169,10 @@ Positional syntax also works: `python commit_critic.py analyze` / `python commit
 
 This matters because "fix bug" might be acceptable if the diff shows a one-line typo fix, but terrible if it touches 15 files across 3 modules.
 
+### README-Based Project Context
+
+When available, the repo's README is read (up to 1500 chars) and prepended to every LLM prompt. This gives the model project-specific context -- it can score "add caching" differently for a database library vs. a frontend app, and suggest scope names that match the project's actual modules.
+
 ### Stats Computed in Python
 
 Average score, vague commit count, and one-word commit count are calculated deterministically in Python -- never delegated to the LLM. This avoids arithmetic hallucinations.
@@ -179,7 +183,7 @@ Average score, vague commit count, and one-word commit count are calculated dete
 - Phase 2 uses deterministic index mapping (never trusts LLM-returned identifiers)
 - Token usage is tracked and displayed for every operation
 - Remote repos are shallow-cloned to minimize bandwidth
-- DeepWiki URLs are automatically converted to GitHub for cloning
+- Repo README is read and injected as project context for more accurate scoring
 
 ### Security
 
@@ -195,8 +199,8 @@ Single-file design (`commit_critic.py`, ~740 lines):
 |---------|---------|
 | Configuration | Interactive model picker, `.env` persistence |
 | Data models | Pydantic models for structured LLM output |
-| Git operations | Log parsing, diff extraction, shallow clone, branch/URL validation |
-| LLM interaction | Two-phase analysis, commit suggestion, generic retry logic |
+| Git operations | Log parsing, diff extraction, shallow clone, README reading, validation |
+| LLM interaction | Two-phase analysis with README context, commit suggestion, retry logic |
 | Output formatting | Rich panels for terminal display |
 | CLI commands | Typer `--analyze` and `--write` with positional support |
 
@@ -214,4 +218,4 @@ Single-file design (`commit_critic.py`, ~740 lines):
 pytest test_commit_critic.py -v
 ```
 
-21 tests covering models, git parsing, LLM integration (mocked), output formatting, histogram, and author filtering.
+26 tests covering models, git parsing, README reading, LLM integration (mocked), output formatting, histogram, and author filtering.
