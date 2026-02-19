@@ -134,8 +134,18 @@ def getStagedStat() -> str:
     return result.stdout.strip()
 
 
+def normalizeRepoUrl(url: str) -> str:
+    """Convert DeepWiki or other known URLs to a cloneable GitHub URL."""
+    if "deepwiki.com/" in url:
+        # https://deepwiki.com/owner/repo -> https://github.com/owner/repo
+        path = url.split("deepwiki.com/", 1)[1].strip("/")
+        return f"https://github.com/{path}"
+    return url
+
+
 def cloneShallow(url: str, count: int) -> str:
     """Shallow clone a repo to a temp directory. Returns the path."""
+    url = normalizeRepoUrl(url)
     dir_tmp = tempfile.mkdtemp(prefix="commit_critic_")
     result = subprocess.run(
         ["git", "clone", "--depth", str(count), url, dir_tmp],
