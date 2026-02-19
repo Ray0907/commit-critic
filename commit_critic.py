@@ -144,19 +144,23 @@ def normalizeRepoUrl(url: str) -> str:
 
 
 def cloneShallow(url: str, count: int) -> str:
-    """Shallow clone a repo to a temp directory. Returns the path."""
-    url = normalizeRepoUrl(url)
-    dir_tmp = tempfile.mkdtemp(prefix="commit_critic_")
-    result = subprocess.run(
-        ["git", "clone", "--depth", str(count), url, dir_tmp],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
+    """Shallow clone a repo to a temp directory. Tries normalized URL first, falls back to original."""
+    url_normalized = normalizeRepoUrl(url)
+    urls_to_try = [url_normalized] if url_normalized == url else [url_normalized, url]
+
+    for attempt_url in urls_to_try:
+        dir_tmp = tempfile.mkdtemp(prefix="commit_critic_")
+        result = subprocess.run(
+            ["git", "clone", "--depth", str(count), attempt_url, dir_tmp],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return dir_tmp
         shutil.rmtree(dir_tmp, ignore_errors=True)
-        console.print(f"[red]Failed to clone {url}:[/red] {result.stderr.strip()}")
-        raise typer.Exit(1)
-    return dir_tmp
+
+    console.print(f"[red]Failed to clone {url}:[/red] {result.stderr.strip()}")
+    raise typer.Exit(1)
 
 
 def executeCommit(message: str) -> None:
