@@ -224,3 +224,57 @@ class TestLlmHelpers:
             prompt_sent = mock_comp.call_args[1]["messages"][0]["content"]
             assert "truncated" in prompt_sent
             assert len(prompt_sent) < 20000
+
+
+class TestOutputFormatting:
+    def test_render_analysis_shows_bad_and_good(self):
+        from io import StringIO
+        from rich.console import Console as RichConsole
+        from commit_critic import renderAnalysis
+        import commit_critic
+
+        result = AnalysisResult(
+            commits=[
+                CommitScore(hash="a", message="wip", score=1, issue="No info", suggestion="Be specific"),
+                CommitScore(hash="b", message="feat: add login", score=9, praise="Clear and scoped"),
+            ],
+            average_score=5.0,
+            count_vague=1,
+            count_one_word=1,
+        )
+        output = StringIO()
+        test_console = RichConsole(file=output, force_terminal=True)
+
+        original_console = commit_critic.console
+        commit_critic.console = test_console
+        try:
+            renderAnalysis(result, 500)
+        finally:
+            commit_critic.console = original_console
+
+        rendered = output.getvalue()
+        assert "wip" in rendered
+        assert "feat: add login" in rendered
+        assert "5.0" in rendered
+
+    def test_render_analysis_no_division_by_zero(self):
+        from io import StringIO
+        from rich.console import Console as RichConsole
+        from commit_critic import renderAnalysis
+        import commit_critic
+
+        result = AnalysisResult(
+            commits=[],
+            average_score=0.0,
+            count_vague=0,
+            count_one_word=0,
+        )
+        output = StringIO()
+        test_console = RichConsole(file=output, force_terminal=True)
+
+        original_console = commit_critic.console
+        commit_critic.console = test_console
+        try:
+            renderAnalysis(result, 0)
+        finally:
+            commit_critic.console = original_console

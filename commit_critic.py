@@ -347,5 +347,54 @@ Rules:
     return result, tokens
 
 
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
+
+def renderAnalysis(result: AnalysisResult, tokens: int) -> None:
+    """Render analysis with rich panels: bad commits, good commits, stats."""
+    bad_commits = [c for c in result.commits if c.score < 7]
+    good_commits = [c for c in result.commits if c.score >= 7]
+
+    if bad_commits:
+        lines = []
+        for c in sorted(bad_commits, key=lambda x: x.score):
+            lines.append(f'Commit: "{c.message}"')
+            lines.append(f"Score: {c.score}/10")
+            if c.issue:
+                lines.append(f"Issue: {c.issue}")
+            if c.suggestion:
+                lines.append(f'Better: "{c.suggestion}"')
+            lines.append("")
+        console.print(Panel(
+            "\n".join(lines).strip(),
+            title="COMMITS THAT NEED WORK",
+            border_style="red",
+        ))
+
+    if good_commits:
+        lines = []
+        for c in sorted(good_commits, key=lambda x: x.score, reverse=True):
+            lines.append(f'Commit: "{c.message}"')
+            lines.append(f"Score: {c.score}/10")
+            if c.praise:
+                lines.append(f"Why it's good: {c.praise}")
+            lines.append("")
+        console.print(Panel(
+            "\n".join(lines).strip(),
+            title="WELL-WRITTEN COMMITS",
+            border_style="green",
+        ))
+
+    total = max(len(result.commits), 1)
+    stats_lines = [
+        f"Average score: {result.average_score}/10",
+        f"Vague commits: {result.count_vague} ({result.count_vague * 100 // total}%)",
+        f"One-word commits: {result.count_one_word} ({result.count_one_word * 100 // total}%)",
+        f"Tokens used: {tokens:,}",
+    ]
+    console.print(Panel("\n".join(stats_lines), title="YOUR STATS", border_style="cyan"))
+
+
 if __name__ == "__main__":
     app()
