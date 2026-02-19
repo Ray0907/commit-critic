@@ -1,13 +1,64 @@
 """Tests for commit_critic.py."""
 
-import json
-import pytest
-from unittest.mock import patch, MagicMock
-from commit_critic import CommitScore, AnalysisResult, SuggestedCommit
+from __future__ import annotations
 
+import json
+from io import StringIO
+from unittest.mock import MagicMock, patch
+
+import pytest
+from click.exceptions import Exit
+from rich.console import Console as RichConsole
+
+import commit_critic
+from commit_critic import (
+    AnalysisResult,
+    CommitScore,
+    RECORD_SEP,
+    SuggestedCommit,
+    _buildHistogram,
+    analyzeCommits,
+    checkGitRepo,
+    getCommits,
+    parseLlmJson,
+    renderAnalysis,
+    suggestCommitMessage,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _makeLlmResponse(content: str, total_tokens: int = 500) -> MagicMock:
+    """Build a mock LLM response with the given JSON content."""
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = content
+    response.usage = MagicMock()
+    response.usage.total_tokens = total_tokens
+    return response
+
+
+def _makeSubprocessResult(
+    returncode: int = 0,
+    stdout: str = "",
+    stderr: str = "",
+) -> MagicMock:
+    """Build a mock subprocess.run result."""
+    result = MagicMock()
+    result.returncode = returncode
+    result.stdout = stdout
+    result.stderr = stderr
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
 
 class TestModels:
-    def test_commit_score_full(self):
+    def test_commit_score_full(self) -> None:
         score = CommitScore(
             hash="abc12345",
             message="fix bug",
@@ -18,7 +69,7 @@ class TestModels:
         assert score.score == 2
         assert score.praise is None
 
-    def test_commit_score_good(self):
+    def test_commit_score_good(self) -> None:
         score = CommitScore(
             hash="def67890",
             message="feat(api): add caching",
@@ -28,7 +79,7 @@ class TestModels:
         assert score.issue is None
         assert score.suggestion is None
 
-    def test_analysis_result(self):
+    def test_analysis_result(self) -> None:
         result = AnalysisResult(
             commits=[
                 CommitScore(hash="a", message="wip", score=1, issue="No info"),
@@ -41,25 +92,27 @@ class TestModels:
         assert len(result.commits) == 2
         assert result.average_score == 4.5
 
-    def test_suggested_commit(self):
-        s = SuggestedCommit(
+    def test_suggested_commit(self) -> None:
+        suggested = SuggestedCommit(
             message="refactor(auth): extract validation",
-            summary="Extracted validation logic into helper",
+            changes=["Extracted validation logic into helper"],
         )
-        assert "refactor" in s.message
+        assert "refactor" in suggested.message
+        assert len(suggested.changes) == 1
 
+
+# ---------------------------------------------------------------------------
+# Git operations
+# ---------------------------------------------------------------------------
 
 class TestGitOperations:
-    def test_get_commits_parses_log(self):
-        from commit_critic import getCommits, RECORD_SEP
-
-        fake_output = (
-            f"abcdef1234567890{RECORD_SEP}feat: add login{RECORD_SEP}body text{RECORD_SEP}\n"
+    def test_get_commits_parses_log(self) -> None:
+        output_fake = (
+            f"abcdef1234567890{RECORD_SEP}feat: add login{RECORD_SEP}"
+            f"body text{RECORD_SEP}\n"
             f"1234567890abcdef{RECORD_SEP}fix bug{RECORD_SEP}{RECORD_SEP}"
         )
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = fake_output
+        mock_result = _makeSubprocessResult(stdout=output_fake)
 
         with patch("commit_critic.subprocess.run", return_value=mock_result):
             commits = getCommits(2, ".")
@@ -71,114 +124,132 @@ class TestGitOperations:
         assert commits[1]["subject"] == "fix bug"
         assert commits[1]["body"] == ""
 
-    def test_get_commits_empty_repo(self):
-        from commit_critic import getCommits
-
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = ""
+    def test_get_commits_empty_repo(self) -> None:
+        mock_result = _makeSubprocessResult(stdout="")
 
         with patch("commit_critic.subprocess.run", return_value=mock_result):
             commits = getCommits(50, ".")
 
         assert commits == []
 
-    def test_check_git_repo_fails_outside_repo(self):
-        from commit_critic import checkGitRepo
-
-        mock_result = MagicMock()
-        mock_result.returncode = 128
-        mock_result.stderr = "fatal: not a git repository"
-
-        from click.exceptions import Exit
+    def test_check_git_repo_fails_outside_repo(self) -> None:
+        mock_result = _makeSubprocessResult(
+            returncode=128,
+            stderr="fatal: not a git repository",
+        )
 
         with patch("commit_critic.subprocess.run", return_value=mock_result):
             with pytest.raises(Exit):
                 checkGitRepo("/tmp/not-a-repo")
 
 
-class TestLlmHelpers:
-    def test_parse_llm_json_valid(self):
-        from commit_critic import parseLlmJson
+# ---------------------------------------------------------------------------
+# LLM helpers
+# ---------------------------------------------------------------------------
 
+class TestLlmHelpers:
+    @pytest.fixture(autouse=True)
+    def set_model(self) -> None:
+        commit_critic._model = "test-model"
+        yield
+        commit_critic._model = None
+
+    def test_parse_llm_json_valid(self) -> None:
         raw = json.dumps({
             "commits": [
-                {"hash": "abc", "message": "wip", "score": 1, "issue": "No info", "suggestion": "Describe changes", "praise": None}
+                {
+                    "hash": "abc",
+                    "message": "wip",
+                    "score": 1,
+                    "issue": "No info",
+                    "suggestion": "Describe changes",
+                    "praise": None,
+                }
             ],
-            "average_score": 1.0,
-            "count_vague": 1,
-            "count_one_word": 1,
         })
         result = parseLlmJson(raw, AnalysisResult)
         assert result is not None
         assert result.commits[0].score == 1
 
-    def test_parse_llm_json_invalid(self):
-        from commit_critic import parseLlmJson
-
+    def test_parse_llm_json_invalid(self) -> None:
         result = parseLlmJson("not json {{{", AnalysisResult)
         assert result is None
 
-    def test_parse_llm_json_wrong_schema(self):
-        from commit_critic import parseLlmJson
-
+    def test_parse_llm_json_wrong_schema(self) -> None:
         result = parseLlmJson('{"wrong": "schema"}', AnalysisResult)
         assert result is None
 
-    def test_analyze_commits_calls_llm(self):
-        from commit_critic import analyzeCommits
+    def test_analyze_commits_calls_llm(self) -> None:
+        response_fake = _makeLlmResponse(
+            content=json.dumps({
+                "commits": [
+                    {
+                        "hash": "abc12345",
+                        "message": "wip",
+                        "score": 2,
+                        "issue": "Vague",
+                        "suggestion": "Be specific",
+                        "praise": None,
+                    },
+                    {
+                        "hash": "def67890",
+                        "message": "feat: add X",
+                        "score": 8,
+                        "issue": None,
+                        "suggestion": None,
+                        "praise": "Clear",
+                    },
+                ],
+            }),
+            total_tokens=500,
+        )
 
-        fake_response = MagicMock()
-        fake_response.choices = [MagicMock()]
-        fake_response.choices[0].message.content = json.dumps({
-            "commits": [
-                {"hash": "abc12345", "message": "wip", "score": 2, "issue": "Vague", "suggestion": "Be specific", "praise": None},
-                {"hash": "def67890", "message": "feat: add X", "score": 8, "issue": None, "suggestion": None, "praise": "Clear"},
-            ],
-            "average_score": 5.0,
-            "count_vague": 1,
-            "count_one_word": 1,
-        })
-        fake_response.usage = MagicMock()
-        fake_response.usage.total_tokens = 500
-
-        with patch("commit_critic.completion", return_value=fake_response):
+        with patch("commit_critic.completion", return_value=response_fake):
             result, tokens = analyzeCommits([
                 {"hash": "abc12345", "subject": "wip", "body": ""},
                 {"hash": "def67890", "subject": "feat: add X", "body": ""},
             ])
 
         assert len(result.commits) == 2
-        assert result.average_score == 5.0
+        assert result.average_score == 5.0  # (2+8)/2
+        assert result.count_vague == 1      # score < 7: "wip" (score=2)
+        assert result.count_one_word == 1   # "wip" is one word
         assert tokens == 500
 
-    def test_phase2_uses_deterministic_index(self):
+    def test_phase2_uses_deterministic_index(self) -> None:
         """Phase 2 should use index-based mapping, not LLM-returned hashes."""
-        from commit_critic import analyzeCommits
+        response_phase1 = _makeLlmResponse(
+            content=json.dumps({
+                "commits": [
+                    {
+                        "hash": "aaa",
+                        "message": "fix",
+                        "score": 2,
+                        "issue": "Vague",
+                        "suggestion": "old suggestion",
+                        "praise": None,
+                    },
+                    {
+                        "hash": "bbb",
+                        "message": "feat: good",
+                        "score": 8,
+                        "issue": None,
+                        "suggestion": None,
+                        "praise": "Nice",
+                    },
+                ],
+            }),
+            total_tokens=400,
+        )
 
-        phase1_response = MagicMock()
-        phase1_response.choices = [MagicMock()]
-        phase1_response.choices[0].message.content = json.dumps({
-            "commits": [
-                {"hash": "aaa", "message": "fix", "score": 2, "issue": "Vague", "suggestion": "old suggestion", "praise": None},
-                {"hash": "bbb", "message": "feat: good", "score": 8, "issue": None, "suggestion": None, "praise": "Nice"},
-            ],
-            "average_score": 5.0,
-            "count_vague": 1,
-            "count_one_word": 1,
-        })
-        phase1_response.usage = MagicMock()
-        phase1_response.usage.total_tokens = 400
+        response_phase2 = _makeLlmResponse(
+            content=json.dumps([
+                {"index": 0, "suggestion": "fix(auth): resolve token expiration"}
+            ]),
+            total_tokens=200,
+        )
 
-        phase2_response = MagicMock()
-        phase2_response.choices = [MagicMock()]
-        phase2_response.choices[0].message.content = json.dumps([
-            {"index": 0, "suggestion": "fix(auth): resolve token expiration"}
-        ])
-        phase2_response.usage = MagicMock()
-        phase2_response.usage.total_tokens = 200
-
-        with patch("commit_critic.completion", side_effect=[phase1_response, phase2_response]), \
+        with patch("commit_critic.completion", side_effect=[response_phase1, response_phase2]), \
              patch("commit_critic.getCommitDiff", return_value="file.py | 10 +++---"):
             result, tokens = analyzeCommits([
                 {"hash": "aaaa1234", "subject": "fix", "body": ""},
@@ -188,51 +259,54 @@ class TestLlmHelpers:
         assert result.commits[0].suggestion == "fix(auth): resolve token expiration"
         assert tokens == 600
 
-    def test_suggest_commit_message(self):
-        from commit_critic import suggestCommitMessage
+    def test_suggest_commit_message(self) -> None:
+        response_fake = _makeLlmResponse(
+            content=json.dumps({
+                "message": "feat(auth): add login endpoint",
+                "changes": ["Added login endpoint", "Configured JWT tokens"],
+            }),
+            total_tokens=300,
+        )
 
-        fake_response = MagicMock()
-        fake_response.choices = [MagicMock()]
-        fake_response.choices[0].message.content = json.dumps({
-            "message": "feat(auth): add login endpoint",
-            "summary": "Added login endpoint with JWT tokens",
-        })
-        fake_response.usage = MagicMock()
-        fake_response.usage.total_tokens = 300
-
-        with patch("commit_critic.completion", return_value=fake_response):
+        with patch("commit_critic.completion", return_value=response_fake):
             result, tokens = suggestCommitMessage("diff content", "1 file changed")
 
         assert "feat" in result.message
         assert tokens == 300
 
-    def test_suggest_commit_truncates_large_diff(self):
-        from commit_critic import suggestCommitMessage
+    def test_suggest_commit_truncates_large_diff(self) -> None:
+        diff_large = "x" * 20000
+        response_fake = _makeLlmResponse(
+            content=json.dumps({
+                "message": "chore: update",
+                "changes": ["Updated files"],
+            }),
+            total_tokens=200,
+        )
 
-        large_diff = "x" * 20000
-        fake_response = MagicMock()
-        fake_response.choices = [MagicMock()]
-        fake_response.choices[0].message.content = json.dumps({
-            "message": "chore: update",
-            "summary": "Updated files",
-        })
-        fake_response.usage = MagicMock()
-        fake_response.usage.total_tokens = 200
-
-        with patch("commit_critic.completion", return_value=fake_response) as mock_comp:
-            suggestCommitMessage(large_diff, "stat")
+        with patch("commit_critic.completion", return_value=response_fake) as mock_comp:
+            suggestCommitMessage(diff_large, "stat")
             prompt_sent = mock_comp.call_args[1]["messages"][0]["content"]
             assert "truncated" in prompt_sent
             assert len(prompt_sent) < 20000
 
 
-class TestOutputFormatting:
-    def test_render_analysis_shows_bad_and_good(self):
-        from io import StringIO
-        from rich.console import Console as RichConsole
-        from commit_critic import renderAnalysis
-        import commit_critic
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
 
+class TestOutputFormatting:
+    @pytest.fixture()
+    def capture_console(self) -> StringIO:
+        """Temporarily replace commit_critic.console to capture output."""
+        output = StringIO()
+        console_test = RichConsole(file=output, force_terminal=True)
+        original = commit_critic.console
+        commit_critic.console = console_test
+        yield output
+        commit_critic.console = original
+
+    def test_render_analysis_shows_bad_and_good(self, capture_console: StringIO) -> None:
         result = AnalysisResult(
             commits=[
                 CommitScore(hash="a", message="wip", score=1, issue="No info", suggestion="Be specific"),
@@ -242,39 +316,86 @@ class TestOutputFormatting:
             count_vague=1,
             count_one_word=1,
         )
-        output = StringIO()
-        test_console = RichConsole(file=output, force_terminal=True)
 
-        original_console = commit_critic.console
-        commit_critic.console = test_console
-        try:
-            renderAnalysis(result, 500)
-        finally:
-            commit_critic.console = original_console
+        renderAnalysis(result, 500)
 
-        rendered = output.getvalue()
+        rendered = capture_console.getvalue()
         assert "wip" in rendered
         assert "feat: add login" in rendered
         assert "5.0" in rendered
 
-    def test_render_analysis_no_division_by_zero(self):
-        from io import StringIO
-        from rich.console import Console as RichConsole
-        from commit_critic import renderAnalysis
-        import commit_critic
-
+    def test_render_analysis_no_division_by_zero(self, capture_console: StringIO) -> None:
         result = AnalysisResult(
             commits=[],
             average_score=0.0,
             count_vague=0,
             count_one_word=0,
         )
-        output = StringIO()
-        test_console = RichConsole(file=output, force_terminal=True)
 
-        original_console = commit_critic.console
-        commit_critic.console = test_console
-        try:
-            renderAnalysis(result, 0)
-        finally:
-            commit_critic.console = original_console
+        renderAnalysis(result, 0)
+
+    def test_render_analysis_includes_histogram(self, capture_console: StringIO) -> None:
+        result = AnalysisResult(
+            commits=[
+                CommitScore(hash="a", message="wip", score=1, issue="Bad"),
+                CommitScore(hash="b", message="fix", score=3, issue="Vague"),
+                CommitScore(hash="c", message="feat: add X", score=8, praise="Good"),
+            ],
+            average_score=4.0,
+            count_vague=2,
+            count_one_word=2,
+        )
+
+        renderAnalysis(result, 100)
+
+        rendered = capture_console.getvalue()
+        assert "Score distribution" in rendered
+        assert "1-3" in rendered
+        assert "7-8" in rendered
+
+
+class TestHistogram:
+    def test_histogram_buckets(self) -> None:
+        commits = [
+            CommitScore(hash="a", message="wip", score=1, issue="Bad"),
+            CommitScore(hash="b", message="fix", score=2, issue="Bad"),
+            CommitScore(hash="c", message="update", score=5, issue="Meh"),
+            CommitScore(hash="d", message="feat: X", score=9, praise="Great"),
+        ]
+        output = _buildHistogram(commits)
+        assert "1-3" in output
+        assert "4-6" in output
+        assert "9-10" in output
+        # Verify actual counts: 2 in 1-3, 1 in 4-6, 0 in 7-8, 1 in 9-10
+        lines = output.strip().split("\n")
+        count_line_13 = [l for l in lines if "1-3" in l][0]
+        count_line_46 = [l for l in lines if "4-6" in l][0]
+        count_line_78 = [l for l in lines if "7-8" in l][0]
+        assert count_line_13.strip().endswith("2")
+        assert count_line_46.strip().endswith("1")
+        assert count_line_78.strip().endswith("0")
+
+    def test_histogram_empty(self) -> None:
+        output = _buildHistogram([])
+        assert "Score distribution" in output
+
+
+class TestAuthorFilter:
+    def test_get_commits_passes_author_flag(self) -> None:
+        mock_result = _makeSubprocessResult(stdout="")
+
+        with patch("commit_critic.subprocess.run", return_value=mock_result) as mock_run:
+            getCommits(10, ".", author="ray")
+
+        cmd = mock_run.call_args[0][0]
+        assert "--author" in cmd
+        assert "ray" in cmd
+
+    def test_get_commits_no_author(self) -> None:
+        mock_result = _makeSubprocessResult(stdout="")
+
+        with patch("commit_critic.subprocess.run", return_value=mock_result) as mock_run:
+            getCommits(10, ".")
+
+        cmd = mock_run.call_args[0][0]
+        assert "--author" not in cmd

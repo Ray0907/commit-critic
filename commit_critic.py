@@ -7,7 +7,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+from bisect import bisect_left
+from typing import TypeVar
 
+import litellm
 import typer
 from dotenv import load_dotenv
 from litellm import completion
@@ -16,7 +19,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
-load_dotenv()
+T = TypeVar("T", bound=BaseModel)
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_DIR, ".env"))
+
+litellm.drop_params = True
 
 console = Console()
 
@@ -25,9 +33,81 @@ console = Console()
 # Configuration
 # ---------------------------------------------------------------------------
 
-def getModel() -> str:
-    """Get the LLM model from env or default."""
-    return os.environ.get("LITELLM_MODEL", "gpt-4o-mini")
+POPULAR_MODELS = [
+    ("gpt-4o-mini",                        "OpenAI",    "OPENAI_API_KEY"),
+    ("gpt-4o",                             "OpenAI",    "OPENAI_API_KEY"),
+    ("claude-sonnet-4-20250514",           "Anthropic", "ANTHROPIC_API_KEY"),
+    ("claude-haiku-4-5-20251001",          "Anthropic", "ANTHROPIC_API_KEY"),
+    ("gemini/gemini-2.0-flash",            "Google",    "GEMINI_API_KEY"),
+    ("gemini/gemini-2.5-pro-preview-05-06", "Google",   "GEMINI_API_KEY"),
+]
+
+_model: str | None = None
+
+
+def resolveModel() -> str:
+    """Resolve model from --model flag, env var, or interactive picker."""
+    global _model
+    if _model:
+        return _model
+
+    env_model = os.environ.get("LITELLM_MODEL")
+    if env_model:
+        _model = env_model
+        return _model
+
+    console.print("[bold]No model configured.[/bold] Pick one:\n")
+    for i, (name, provider, key_env) in enumerate(POPULAR_MODELS, 1):
+        key_status = "[green]set[/green]" if os.environ.get(key_env) else "[dim]not set[/dim]"
+        console.print(f"  {i}) {name}  [dim]({provider}, {key_env}: {key_status})[/dim]")
+    console.print("\n  Or enter any [bold]litellm[/bold]-compatible model name.")
+    console.print()
+
+    choice = Prompt.ask(
+        "Enter number or model name",
+        default="1",
+    )
+
+    if choice.isdigit() and 1 <= int(choice) <= len(POPULAR_MODELS):
+        _model = POPULAR_MODELS[int(choice) - 1][0]
+    else:
+        _model = choice.strip()
+
+    # Offer to save so user doesn't have to pick every time
+    save = Prompt.ask(
+        f"Save [bold]{_model}[/bold] to .env?",
+        choices=["y", "n"],
+        default="y",
+    )
+    if save == "y":
+        _saveModelToEnv(_model)
+
+    console.print(f"Using model: [bold]{_model}[/bold]\n")
+    return _model
+
+
+def _saveModelToEnv(model_name: str) -> None:
+    """Append or update LITELLM_MODEL in .env file."""
+    name_sanitized = model_name.replace("\n", "").replace("\r", "").strip()
+    path_env = os.path.join(_DIR, ".env")
+    line_new = f"LITELLM_MODEL={name_sanitized}\n"
+
+    lines_existing: list[str] = []
+    if os.path.exists(path_env):
+        with open(path_env) as f:
+            lines_existing = f.readlines()
+
+    lines_updated = [
+        line_new if line.startswith("LITELLM_MODEL=") else line
+        for line in lines_existing
+    ]
+    if not any(line.startswith("LITELLM_MODEL=") for line in lines_existing):
+        lines_updated.append(line_new)
+
+    with open(path_env, "w") as f:
+        f.writelines(lines_updated)
+
+    console.print(f"[green]Saved to {path_env}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -45,14 +125,14 @@ class CommitScore(BaseModel):
 
 class AnalysisResult(BaseModel):
     commits: list[CommitScore]
-    average_score: float
-    count_vague: int
-    count_one_word: int
+    average_score: float = 0.0
+    count_vague: int = 0
+    count_one_word: int = 0
 
 
 class SuggestedCommit(BaseModel):
     message: str
-    summary: str
+    changes: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +140,50 @@ class SuggestedCommit(BaseModel):
 # ---------------------------------------------------------------------------
 
 RECORD_SEP = "\x1e"  # ASCII record separator (from pre-commit pattern)
+
+
+def getGitRepoName(path: str = ".") -> str | None:
+    """Get the git repo name from the remote or directory name."""
+    result = subprocess.run(
+        ["git", "-C", path, "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        url = result.stdout.strip().rstrip("/")
+        name = url.split("/")[-1]
+        return name.removesuffix(".git")
+    # Fallback: top-level directory name
+    result = subprocess.run(
+        ["git", "-C", path, "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return os.path.basename(result.stdout.strip())
+    return None
+
+
+def getGitBranch(path: str = ".") -> str | None:
+    """Get the current git branch name."""
+    result = subprocess.run(
+        ["git", "-C", path, "branch", "--show-current"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    return None
+
+
+def printStatusLine(path: str = ".", branch: str | None = None) -> None:
+    """Print a Claude Code-style status line: [model] repo | branch."""
+    model_name = resolveModel()
+    repo_name = getGitRepoName(path) or "no-repo"
+    branch_name = branch or getGitBranch(path) or "detached"
+    console.print(
+        f"[dim]\\[{model_name}] {repo_name} | {branch_name}[/dim]\n"
+    )
 
 
 def checkGitRepo(path: str = ".") -> None:
@@ -74,11 +198,30 @@ def checkGitRepo(path: str = ".") -> None:
         raise typer.Exit(1)
 
 
-def getCommits(count: int, repo_path: str = ".") -> list[dict]:
+def _validateBranchName(name: str) -> None:
+    """Reject branch names that could inject git options."""
+    if name.startswith("-"):
+        console.print("[red]Invalid branch name: must not start with '-'[/red]")
+        raise typer.Exit(1)
+
+
+def getCommits(
+    count: int,
+    repo_path: str = ".",
+    branch: str | None = None,
+    author: str | None = None,
+) -> list[dict]:
     """Extract commits from git log. Returns list of {hash, subject, body}."""
+    if branch:
+        _validateBranchName(branch)
     fmt = f"%H{RECORD_SEP}%s{RECORD_SEP}%b{RECORD_SEP}"
+    cmd = ["git", "-C", repo_path, "log", f"--format={fmt}", "-n", str(count)]
+    if branch:
+        cmd.append(branch)
+    if author:
+        cmd.extend(["--author", author])
     result = subprocess.run(
-        ["git", "-C", repo_path, "log", f"--format={fmt}", "-n", str(count)],
+        cmd,
         capture_output=True,
         text=True,
     )
@@ -143,23 +286,44 @@ def normalizeRepoUrl(url: str) -> str:
     return url
 
 
-def cloneShallow(url: str, count: int) -> str:
-    """Shallow clone a repo to a temp directory. Tries normalized URL first, falls back to original."""
-    url_normalized = normalizeRepoUrl(url)
-    urls_to_try = [url_normalized] if url_normalized == url else [url_normalized, url]
+def _validateGitUrl(url: str) -> None:
+    """Reject URLs that could be used for command injection or local file access."""
+    stripped = url.strip()
+    if stripped.startswith("-"):
+        console.print("[red]Invalid URL: must not start with '-'[/red]")
+        raise typer.Exit(1)
+    if stripped.startswith(("file://", "/")):
+        console.print("[red]Local paths not supported. Use a remote URL.[/red]")
+        raise typer.Exit(1)
 
-    for attempt_url in urls_to_try:
+
+def cloneShallow(url: str, count: int) -> str:
+    """Shallow clone a repo to a temp directory.
+
+    Tries normalized URL first, falls back to original.
+    """
+    _validateGitUrl(url)
+    url_normalized = normalizeRepoUrl(url)
+    urls_to_try = (
+        [url_normalized]
+        if url_normalized == url
+        else [url_normalized, url]
+    )
+
+    error_last = ""
+    for url_attempt in urls_to_try:
         dir_tmp = tempfile.mkdtemp(prefix="commit_critic_")
         result = subprocess.run(
-            ["git", "clone", "--depth", str(count), attempt_url, dir_tmp],
+            ["git", "clone", "--depth", str(count), url_attempt, dir_tmp],
             capture_output=True,
             text=True,
         )
         if result.returncode == 0:
             return dir_tmp
+        error_last = result.stderr.strip()
         shutil.rmtree(dir_tmp, ignore_errors=True)
 
-    console.print(f"[red]Failed to clone {url}:[/red] {result.stderr.strip()}")
+    console.print(f"[red]Failed to clone {url}:[/red] {error_last}")
     raise typer.Exit(1)
 
 
@@ -191,18 +355,19 @@ def callLlm(prompt: str) -> tuple[str, int]:
     """Call LLM and return (content, total_tokens). Handles auth errors."""
     try:
         response = completion(
-            model=getModel(),
+            model=resolveModel(),
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
+            temperature=0,
         )
     except Exception as e:
         error_msg = str(e).lower()
-        if "auth" in error_msg or "api key" in error_msg or "api_key" in error_msg:
+        if any(k in error_msg for k in ("auth", "api key", "api_key")):
             console.print(
                 "[red]Authentication failed.[/red]\n"
                 "Set your API key: export OPENAI_API_KEY=sk-...\n"
                 "(or ANTHROPIC_API_KEY for Claude)\n"
-                "Choose model: export LITELLM_MODEL=gpt-4o-mini"
+                "Choose model: --model gpt-4o-mini (or export LITELLM_MODEL=...)"
             )
             raise typer.Exit(1)
         raise
@@ -212,7 +377,7 @@ def callLlm(prompt: str) -> tuple[str, int]:
     return content, tokens
 
 
-def parseLlmJson(raw: str, model_cls: type):
+def parseLlmJson(raw: str, model_cls: type[T]) -> T | None:
     """Parse LLM JSON response. Returns None on failure."""
     try:
         data = json.loads(raw)
@@ -221,23 +386,90 @@ def parseLlmJson(raw: str, model_cls: type):
         return None
 
 
-def analyzeCommits(commits: list[dict], repo_path: str = ".") -> tuple[AnalysisResult, int]:
-    """
-    Two-phase diff-aware analysis:
-    1. Batch score all messages (one LLM call)
-    2. Re-analyze worst commits with their diff stat context
-    Returns (result, total_tokens).
-    """
-    total_tokens = 0
+def callLlmParsed(prompt: str, model_cls: type[T]) -> tuple[T, int]:
+    """Call LLM, parse response, retry once on failure."""
+    raw, tokens = callLlm(prompt)
+    result = parseLlmJson(raw, model_cls)
+    if result is not None:
+        return result, tokens
 
-    # Phase 1: Batch score
+    raw, tokens_retry = callLlm(prompt)
+    tokens += tokens_retry
+    result = parseLlmJson(raw, model_cls)
+    if result is not None:
+        return result, tokens
+
+    console.print("[red]Failed to parse LLM response.[/red]")
+    console.print(raw[:500], highlight=False, markup=False)
+    raise typer.Exit(1)
+
+
+def _refineSuggestionsWithDiff(
+    result: AnalysisResult,
+    commits: list[dict],
+    repo_path: str,
+) -> int:
+    """Re-analyze worst commits with diff context. Returns tokens used.
+
+    Uses deterministic index mapping -- never trusts LLM-returned identifiers.
+    """
+    worst_with_idx = [
+        (pos, c)
+        for pos, c in enumerate(result.commits)
+        if c.score < 7
+    ]
+    if not worst_with_idx:
+        return 0
+
+    diff_parts = []
+    for idx, (pos, c) in enumerate(worst_with_idx[:5]):
+        hash_original = commits[pos]["hash"]
+        diff_stat = getCommitDiff(hash_original, repo_path)
+        if diff_stat:
+            diff_parts.append(f'[{idx}] "{c.message}"\n{diff_stat[:2000]}')
+
+    if not diff_parts:
+        return 0
+
+    diff_block = "\n".join(diff_parts)
+    prompt = f"""These commits scored poorly. Here's what they actually changed.
+Suggest a better message that matches the actual diff.
+
+{diff_block}
+
+Respond with ONLY valid JSON array using the index number.
+Each suggestion must be a SINGLE LINE in type(scope): description format, max 72 chars.
+[{{"index": 0, "suggestion": "fix(auth): resolve token expiration handling"}}]"""
+
+    raw, tokens = callLlm(prompt)
+
+    try:
+        improvements = json.loads(raw)
+        if isinstance(improvements, list):
+            for item in improvements:
+                idx = item["index"]
+                if 0 <= idx < len(worst_with_idx):
+                    pos_original, _ = worst_with_idx[idx]
+                    result.commits[pos_original].suggestion = item["suggestion"]
+    except (json.JSONDecodeError, KeyError, IndexError):
+        pass  # Phase 2 is best-effort
+
+    return tokens
+
+
+def analyzeCommits(commits: list[dict], repo_path: str = ".") -> tuple[AnalysisResult, int]:
+    """Two-phase diff-aware analysis.
+
+    Phase 1: Batch score all messages (one LLM call).
+    Phase 2: Re-analyze worst commits with their diff stat context.
+    """
     commits_text = "\n".join(
         f"- [{c['hash']}] {c['subject']}"
-        + (f"\n  {c['body']}" if c['body'] else "")
+        + (f"\n  {c['body']}" if c["body"] else "")
         for c in commits
     )
 
-    prompt_phase1 = f"""Analyze these git commit messages and score each one.
+    prompt = f"""Analyze these git commit messages and score each one.
 
 {SCORING_RUBRIC}
 
@@ -248,11 +480,6 @@ For commits scoring < 7, provide:
 For commits scoring >= 7, provide:
 - "praise": why it's good (1 sentence)
 
-Also calculate:
-- average_score: mean of all scores (1 decimal)
-- count_vague: commits with score <= 5
-- count_one_word: commits where the subject is a single word
-
 Commits:
 {commits_text}
 
@@ -260,64 +487,21 @@ Respond with ONLY valid JSON:
 {{
     "commits": [
         {{"hash": "abc12345", "message": "the subject", "score": 5, "issue": "...", "suggestion": "fix(auth): resolve token handling", "praise": null}}
-    ],
-    "average_score": 5.0,
-    "count_vague": 10,
-    "count_one_word": 3
+    ]
 }}"""
 
-    raw, tokens = callLlm(prompt_phase1)
-    total_tokens += tokens
+    result, tokens_phase1 = callLlmParsed(prompt, AnalysisResult)
 
-    result = parseLlmJson(raw, AnalysisResult)
-    if result is None:
-        raw, tokens = callLlm(prompt_phase1)
-        total_tokens += tokens
-        result = parseLlmJson(raw, AnalysisResult)
-        if result is None:
-            console.print("[red]Failed to parse LLM response.[/red]")
-            console.print(raw[:500])
-            raise typer.Exit(1)
+    scores = [c.score for c in result.commits]
+    result.average_score = round(sum(scores) / len(scores), 1) if scores else 0.0
+    result.count_vague = sum(1 for s in scores if s < 7)
+    result.count_one_word = sum(
+        1 for c in commits if len(c["subject"].split()) == 1
+    )
 
-    # Phase 2: Diff-aware re-analysis for worst commits
-    # Deterministic index mapping - never trust LLM-returned identifiers
-    worst_with_idx = [
-        (i, c) for i, c in enumerate(result.commits) if c.score <= 6
-    ]
-    if worst_with_idx:
-        diff_parts = []
-        for idx, (i, c) in enumerate(worst_with_idx[:5]):
-            original_hash = commits[i]["hash"]
-            diff_stat = getCommitDiff(original_hash, repo_path)
-            if diff_stat:
-                diff_stat = diff_stat[:2000]
-                diff_parts.append(f"[{idx}] \"{c.message}\"\n{diff_stat}")
+    tokens_phase2 = _refineSuggestionsWithDiff(result, commits, repo_path)
 
-        if diff_parts:
-            prompt_phase2 = f"""These commits scored poorly. Here's what they actually changed.
-Suggest a better message that matches the actual diff.
-
-{chr(10).join(diff_parts)}
-
-Respond with ONLY valid JSON array using the index number.
-Each suggestion must be a SINGLE LINE in type(scope): description format, max 72 chars.
-[{{"index": 0, "suggestion": "fix(auth): resolve token expiration handling"}}]"""
-
-            raw2, tokens2 = callLlm(prompt_phase2)
-            total_tokens += tokens2
-
-            try:
-                improvements = json.loads(raw2)
-                if isinstance(improvements, list):
-                    for item in improvements:
-                        idx = item["index"]
-                        if 0 <= idx < len(worst_with_idx):
-                            orig_idx, _ = worst_with_idx[idx]
-                            result.commits[orig_idx].suggestion = item["suggestion"]
-            except (json.JSONDecodeError, KeyError, IndexError):
-                pass  # Phase 2 is best-effort
-
-    return result, total_tokens
+    return result, tokens_phase1 + tokens_phase2
 
 
 def suggestCommitMessage(diff: str, stat: str) -> tuple[SuggestedCommit, int]:
@@ -338,7 +522,7 @@ Diff:
 Respond with ONLY valid JSON:
 {{
     "message": "type(scope): subject\\n\\n- bullet point 1\\n- bullet point 2",
-    "summary": "Human readable summary of what changed"
+    "changes": ["Modified authentication logic", "Added error handling", "Updated unit tests"]
 }}
 
 Rules:
@@ -347,64 +531,84 @@ Rules:
 - Body: bullet points of specific changes
 - Be specific and accurate to the actual diff"""
 
-    raw, tokens = callLlm(prompt)
-    result = parseLlmJson(raw, SuggestedCommit)
-    if result is None:
-        raw, tokens2 = callLlm(prompt)
-        tokens += tokens2
-        result = parseLlmJson(raw, SuggestedCommit)
-        if result is None:
-            console.print("[red]Failed to parse LLM response.[/red]")
-            console.print(raw[:500])
-            raise typer.Exit(1)
-
-    return result, tokens
+    return callLlmParsed(prompt, SuggestedCommit)
 
 
 # ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
 
+def _formatCommitLines(commit: CommitScore) -> list[str]:
+    """Format a single CommitScore into display lines."""
+    lines = [
+        f'Commit: "{commit.message}"',
+        f"Score: {commit.score}/10",
+    ]
+    if commit.issue:
+        lines.append(f"Issue: {commit.issue}")
+    if commit.suggestion:
+        lines.append(f'Better: "{commit.suggestion}"')
+    if commit.praise:
+        lines.append(f"Why it's good: {commit.praise}")
+    return lines
+
+
+BLOCK_CHAR = "\u2588"  # Full block for histogram bars
+
+_BUCKET_THRESHOLDS = [3, 6, 8]  # Upper bounds: 1-3, 4-6, 7-8, 9-10
+_BUCKET_LABELS = ["1-3", "4-6", "7-8", "9-10"]
+
+
+def _buildHistogram(commits: list[CommitScore]) -> str:
+    """Build a text histogram of score distribution."""
+    counts = [0, 0, 0, 0]
+    for c in commits:
+        counts[bisect_left(_BUCKET_THRESHOLDS, c.score)] += 1
+
+    count_max = max(counts, default=1) or 1
+    width_bar = 20
+    lines = ["Score distribution:"]
+    for label, count in zip(_BUCKET_LABELS, counts):
+        bar = BLOCK_CHAR * round(count / count_max * width_bar)
+        lines.append(f"  {label:>4}  {bar:<{width_bar}}  {count}")
+    return "\n".join(lines)
+
+
+def _renderCommitPanel(
+    commits: list[CommitScore],
+    title: str,
+    style: str,
+    reverse: bool = False,
+) -> None:
+    """Render a panel of commits sorted by score."""
+    if not commits:
+        return
+    lines: list[str] = []
+    for c in sorted(commits, key=lambda x: x.score, reverse=reverse):
+        lines.extend(_formatCommitLines(c))
+        lines.append("")
+    console.print(Panel(
+        "\n".join(lines).strip(),
+        title=title,
+        border_style=style,
+    ))
+
+
 def renderAnalysis(result: AnalysisResult, tokens: int) -> None:
     """Render analysis with rich panels: bad commits, good commits, stats."""
-    bad_commits = [c for c in result.commits if c.score < 7]
-    good_commits = [c for c in result.commits if c.score >= 7]
+    commits_bad = [c for c in result.commits if c.score < 7]
+    commits_good = [c for c in result.commits if c.score >= 7]
 
-    if bad_commits:
-        lines = []
-        for c in sorted(bad_commits, key=lambda x: x.score):
-            lines.append(f'Commit: "{c.message}"')
-            lines.append(f"Score: {c.score}/10")
-            if c.issue:
-                lines.append(f"Issue: {c.issue}")
-            if c.suggestion:
-                lines.append(f'Better: "{c.suggestion}"')
-            lines.append("")
-        console.print(Panel(
-            "\n".join(lines).strip(),
-            title="COMMITS THAT NEED WORK",
-            border_style="red",
-        ))
+    _renderCommitPanel(commits_bad, "COMMITS THAT NEED WORK", "red")
+    _renderCommitPanel(commits_good, "WELL-WRITTEN COMMITS", "green", reverse=True)
 
-    if good_commits:
-        lines = []
-        for c in sorted(good_commits, key=lambda x: x.score, reverse=True):
-            lines.append(f'Commit: "{c.message}"')
-            lines.append(f"Score: {c.score}/10")
-            if c.praise:
-                lines.append(f"Why it's good: {c.praise}")
-            lines.append("")
-        console.print(Panel(
-            "\n".join(lines).strip(),
-            title="WELL-WRITTEN COMMITS",
-            border_style="green",
-        ))
-
-    total = max(len(result.commits), 1)
+    count_total = max(len(result.commits), 1)
     stats_lines = [
         f"Average score: {result.average_score}/10",
-        f"Vague commits: {result.count_vague} ({result.count_vague * 100 // total}%)",
-        f"One-word commits: {result.count_one_word} ({result.count_one_word * 100 // total}%)",
+        f"Vague commits: {result.count_vague} ({result.count_vague * 100 // count_total}%)",
+        f"One-word commits: {result.count_one_word} ({result.count_one_word * 100 // count_total}%)",
+        "",
+        _buildHistogram(result.commits),
         f"Tokens used: {tokens:,}",
     ]
     console.print(Panel("\n".join(stats_lines), title="YOUR STATS", border_style="cyan"))
@@ -414,14 +618,26 @@ def renderAnalysis(result: AnalysisResult, tokens: int) -> None:
 # CLI commands
 # ---------------------------------------------------------------------------
 
+app = typer.Typer(add_completion=False, invoke_without_command=True)
+
+
+@app.callback(invoke_without_command=True)
 def main(
+    ctx: typer.Context,
     command: str = typer.Argument(None, help="Command: analyze or write"),
     analyze: bool = typer.Option(False, "--analyze", help="Analyze commit message quality."),
     write: bool = typer.Option(False, "--write", help="Suggest a commit message for staged changes."),
     count: int = typer.Option(50, "--count", "-n", help="Number of commits to analyze."),
     url: str | None = typer.Option(None, "--url", "-u", help="Remote repo URL to analyze."),
+    branch: str = typer.Option("main", "--branch", "-b", help="Branch to analyze."),
+    author: str | None = typer.Option(None, "--author", "-a", help="Filter commits by author name or email."),
+    model: str | None = typer.Option(None, "--model", "-m", help="LLM model to use (e.g. gpt-4o, claude-sonnet-4-20250514)."),
 ) -> None:
     """AI-powered commit message analyzer and writer."""
+    global _model
+    if model:
+        _model = model
+
     # Support both positional (analyze/write) and flag (--analyze/--write) syntax
     if command == "analyze":
         analyze = True
@@ -432,26 +648,25 @@ def main(
         console.print("Use [bold]--analyze[/bold] or [bold]--write[/bold]. See --help.")
         raise typer.Exit(1)
 
-    if not analyze and not write:
-        console.print("Usage: python commit_critic.py [OPTIONS]\n")
-        console.print("  --analyze        Analyze commit message quality")
-        console.print("  --write          Suggest a commit message for staged changes")
-        console.print("  --count, -n      Number of commits to analyze [default: 50]")
-        console.print("  --url, -u        Remote repo URL to analyze")
-        console.print("  --help           Show this message and exit")
-        raise typer.Exit(0)
-
     if analyze and write:
         console.print("[red]Choose one: --analyze or --write, not both.[/red]")
         raise typer.Exit(1)
 
     if analyze:
-        runAnalyze(count, url)
-    else:
+        runAnalyze(count, url, branch, author)
+    elif write:
         runWrite()
+    else:
+        console.print(ctx.get_help())
+        raise typer.Exit(0)
 
 
-def runAnalyze(count: int, url: str | None) -> None:
+def runAnalyze(
+    count: int,
+    url: str | None,
+    branch: str = "main",
+    author: str | None = None,
+) -> None:
     """Analyze commit message quality in a git repository."""
     dir_repo: str | None = None
 
@@ -464,8 +679,10 @@ def runAnalyze(count: int, url: str | None) -> None:
             checkGitRepo()
             path_repo = "."
 
-        with console.status(f"Reading last {count} commits..."):
-            commits = getCommits(count, path_repo)
+        printStatusLine(path_repo, branch)
+
+        with console.status(f"Reading last {count} commits on [bold]{branch}[/bold]..."):
+            commits = getCommits(count, path_repo, branch, author)
 
         if not commits:
             console.print("[yellow]No commits found.[/yellow]")
@@ -486,6 +703,7 @@ def runAnalyze(count: int, url: str | None) -> None:
 def runWrite() -> None:
     """Suggest a commit message for your staged changes."""
     checkGitRepo()
+    printStatusLine()
 
     diff = getStagedDiff()
     if not diff.strip():
@@ -499,7 +717,10 @@ def runWrite() -> None:
     with console.status("Generating commit message..."):
         suggested, tokens = suggestCommitMessage(diff, stat)
 
-    console.print(f"Changes detected:\n{suggested.summary}\n")
+    console.print("Changes detected:")
+    for change in suggested.changes:
+        console.print(f"  - {change}")
+    console.print()
     console.print(Panel(suggested.message, title="Suggested commit message", border_style="green"))
     console.print(f"[dim]Tokens used: {tokens:,}[/dim]\n")
 
@@ -513,4 +734,4 @@ def runWrite() -> None:
 
 
 if __name__ == "__main__":
-    typer.run(main)
+    app()
