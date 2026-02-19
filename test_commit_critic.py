@@ -2,6 +2,7 @@
 
 import json
 import pytest
+from unittest.mock import patch, MagicMock
 from commit_critic import CommitScore, AnalysisResult, SuggestedCommit
 
 
@@ -46,3 +47,51 @@ class TestModels:
             summary="Extracted validation logic into helper",
         )
         assert "refactor" in s.message
+
+
+class TestGitOperations:
+    def test_get_commits_parses_log(self):
+        from commit_critic import getCommits, RECORD_SEP
+
+        fake_output = (
+            f"abcdef1234567890{RECORD_SEP}feat: add login{RECORD_SEP}body text{RECORD_SEP}\n"
+            f"1234567890abcdef{RECORD_SEP}fix bug{RECORD_SEP}{RECORD_SEP}"
+        )
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = fake_output
+
+        with patch("commit_critic.subprocess.run", return_value=mock_result):
+            commits = getCommits(2, ".")
+
+        assert len(commits) == 2
+        assert commits[0]["hash"] == "abcdef12"
+        assert commits[0]["subject"] == "feat: add login"
+        assert commits[0]["body"] == "body text"
+        assert commits[1]["subject"] == "fix bug"
+        assert commits[1]["body"] == ""
+
+    def test_get_commits_empty_repo(self):
+        from commit_critic import getCommits
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+
+        with patch("commit_critic.subprocess.run", return_value=mock_result):
+            commits = getCommits(50, ".")
+
+        assert commits == []
+
+    def test_check_git_repo_fails_outside_repo(self):
+        from commit_critic import checkGitRepo
+
+        mock_result = MagicMock()
+        mock_result.returncode = 128
+        mock_result.stderr = "fatal: not a git repository"
+
+        from click.exceptions import Exit
+
+        with patch("commit_critic.subprocess.run", return_value=mock_result):
+            with pytest.raises(Exit):
+                checkGitRepo("/tmp/not-a-repo")
