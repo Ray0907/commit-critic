@@ -219,6 +219,9 @@ def getCommits(
     if branch:
         cmd.append(branch)
     if author:
+        if author.startswith("-"):
+            console.print("[red]Invalid author: must not start with '-'[/red]")
+            raise typer.Exit(1)
         cmd.extend(["--author", author])
     result = subprocess.run(
         cmd,

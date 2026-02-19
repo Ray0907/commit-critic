@@ -189,7 +189,7 @@ Average score, vague commit count, and one-word commit count are calculated dete
 
 ## Architecture
 
-Single-file design (`commit_critic.py`, ~670 lines):
+Single-file design (`commit_critic.py`, ~740 lines):
 
 | Section | Purpose |
 |---------|---------|
