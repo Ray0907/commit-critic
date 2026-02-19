@@ -396,5 +396,75 @@ def renderAnalysis(result: AnalysisResult, tokens: int) -> None:
     console.print(Panel("\n".join(stats_lines), title="YOUR STATS", border_style="cyan"))
 
 
+# ---------------------------------------------------------------------------
+# CLI commands
+# ---------------------------------------------------------------------------
+
+@app.command()
+def analyze(
+    count: int = typer.Option(50, "--count", "-n", help="Number of commits to analyze."),
+    url: str | None = typer.Option(None, "--url", "-u", help="Remote repo URL to analyze."),
+) -> None:
+    """Analyze commit message quality in a git repository."""
+    dir_repo: str | None = None
+
+    try:
+        if url:
+            with console.status(f"Cloning {url}..."):
+                dir_repo = cloneShallow(url, count)
+            path_repo = dir_repo
+        else:
+            checkGitRepo()
+            path_repo = "."
+
+        with console.status(f"Reading last {count} commits..."):
+            commits = getCommits(count, path_repo)
+
+        if not commits:
+            console.print("[yellow]No commits found.[/yellow]")
+            raise typer.Exit(0)
+
+        console.print(f"Analyzing {len(commits)} commits...\n")
+
+        with console.status("Asking the AI to review your commits..."):
+            result, tokens = analyzeCommits(commits, path_repo)
+
+        renderAnalysis(result, tokens)
+
+    finally:
+        if dir_repo:
+            shutil.rmtree(dir_repo, ignore_errors=True)
+
+
+@app.command()
+def write() -> None:
+    """Suggest a commit message for your staged changes."""
+    checkGitRepo()
+
+    diff = getStagedDiff()
+    if not diff.strip():
+        console.print("[yellow]No staged changes found. Run 'git add' first.[/yellow]")
+        raise typer.Exit(1)
+
+    stat = getStagedStat()
+    last_line = stat.split("\n")[-1].strip() if stat else "no stat"
+    console.print(f"Analyzing staged changes... ({last_line})\n")
+
+    with console.status("Generating commit message..."):
+        suggested, tokens = suggestCommitMessage(diff, stat)
+
+    console.print(f"Changes detected:\n{suggested.summary}\n")
+    console.print(Panel(suggested.message, title="Suggested commit message", border_style="green"))
+    console.print(f"[dim]Tokens used: {tokens:,}[/dim]\n")
+
+    user_input = Prompt.ask(
+        "Press Enter to accept, or type your own message",
+        default="",
+    )
+
+    message_final = user_input if user_input.strip() else suggested.message
+    executeCommit(message_final)
+
+
 if __name__ == "__main__":
     app()
