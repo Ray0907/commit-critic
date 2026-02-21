@@ -7,9 +7,7 @@ Uses a two-phase **diff-aware** approach: the LLM doesn't just check message for
 ## Setup
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 ```
 
 Set your API key:
@@ -36,26 +34,26 @@ Any [litellm-supported provider](https://docs.litellm.ai/docs/providers) works.
 
 ```bash
 # Analyze last 50 commits on main
-python commit_critic.py --analyze
+uv run commit-critic --analyze
 
 # Analyze last 20 commits on a specific branch
-python commit_critic.py --analyze -n 20 -b develop
+uv run commit-critic --analyze -n 20 -b develop
 
 # Analyze a remote repository
-python commit_critic.py --analyze --url="https://github.com/user/repo"
+uv run commit-critic --analyze --url="https://github.com/user/repo"
 
 # Filter by author
-python commit_critic.py --analyze --author="ray"
+uv run commit-critic --analyze --author="ray"
 
 # Use a specific model
-python commit_critic.py --analyze -m gpt-4o
+uv run commit-critic --analyze -m gpt-4o
 ```
 
 <details>
 <summary>Demo: --analyze</summary>
 
 ```
-$ python commit_critic.py --analyze -n 5
+$ uv run commit-critic --analyze -n 5
 
 [gpt-4o-mini] my-project | main
 
@@ -109,7 +107,7 @@ Analyzing 5 commits...
 git add -p
 
 # Get an AI-suggested commit message
-python commit_critic.py --write
+uv run commit-critic --write
 ```
 
 <details>
@@ -117,7 +115,7 @@ python commit_critic.py --write
 
 ```
 $ git add src/auth.py src/middleware.py
-$ python commit_critic.py --write
+$ uv run commit-critic --write
 
 [gpt-4o-mini] my-project | feat/token-refresh
 
@@ -157,7 +155,7 @@ The `--write` flag reads your staged diff, generates a conventional commit messa
 | `--author` | `-a` | Filter commits by author | all authors |
 | `--model` | `-m` | LLM model to use | interactive picker |
 
-Positional syntax also works: `python commit_critic.py analyze` / `python commit_critic.py write`.
+Positional syntax also works: `uv run commit-critic analyze` / `uv run commit-critic write`.
 
 ## How It Works
 
@@ -215,7 +213,7 @@ Single-file design (`commit_critic.py`, ~740 lines):
 ## Tests
 
 ```bash
-pytest test_commit_critic.py -v
+uv run pytest test_commit_critic.py -v
 ```
 
 26 tests covering models, git parsing, README reading, LLM integration (mocked), output formatting, histogram, and author filtering.
