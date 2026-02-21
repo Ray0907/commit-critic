@@ -1,0 +1,20 @@
+[project]
+name = "commit-critic"
+version = "0.1.0"
+description = "AI-powered commit message critic and writer"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "litellm>=1.30.0",
+    "typer>=0.9.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+commit-critic = "commit_critic:app"
