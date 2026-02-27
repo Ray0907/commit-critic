@@ -159,6 +159,44 @@ Positional syntax also works: `uv run commit-critic analyze` / `uv run commit-cr
 
 ## How It Works
 
+```mermaid
+flowchart TD
+    A["CLI: commit-critic --analyze"] --> B{--url provided?}
+    B -->|Yes| C["cloneShallow(url)\nShallow clone to temp dir"]
+    B -->|No| D["checkGitRepo()\nVerify inside git repo"]
+    C --> E["resolveModel()\nenv var / .env / interactive picker"]
+    D --> E
+    E --> F["getCommits()\ngit log with record separator parsing"]
+    F --> G{Commits found?}
+    G -->|No| H["Exit: No commits found"]
+    G -->|Yes| K["analyzeCommits()"]
+
+    subgraph Phase1["Phase 1: Batch Score (1 LLM call)"]
+        K --> L["readRepoReadme()\nFirst 1500 chars as context"]
+        L --> M["Build prompt:\nREADME context + scoring rubric\n+ all commit messages"]
+        M --> N["callLlmParsed()\nlitellm → JSON → Pydantic"]
+        N --> O["Python computes stats:\navg score, vague count, one-word count"]
+    end
+
+    subgraph Phase2["Phase 2: Diff Refinement (1 LLM call)"]
+        O --> P{Any commits\nscore < 7?}
+        P -->|No| S["Skip Phase 2"]
+        P -->|Yes| Q["getCommitDiff() for worst 5\ngit show --stat per commit"]
+        Q --> R["Build prompt with index mapping\n+ diff stats"]
+        R --> T["callLlm() → JSON array"]
+        T --> U["Deterministic index mapping\n→ update suggestions"]
+    end
+
+    S --> V["renderAnalysis()"]
+    U --> V
+
+    subgraph Render["Output (Rich Panels)"]
+        V --> W["Red: COMMITS THAT NEED WORK"]
+        V --> X["Green: WELL-WRITTEN COMMITS"]
+        V --> Y["Cyan: YOUR STATS + histogram"]
+    end
+```
+
 ### Two-Phase Diff-Aware Analysis
 
 **Phase 1 -- Batch Score** (1 LLM call): All commit messages are scored on a 1-10 scale based on clarity, scope, and conventional commit format.
